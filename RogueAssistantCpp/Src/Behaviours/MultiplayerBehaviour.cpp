@@ -23,6 +23,30 @@ enum RogueNetChannel
 #define NET_HANDSHAKE_STATE_SEND_TO_CLIENT      2
 
 u16 const MultiplayerBehaviour::c_DefaultPort = 30025;
+u8 const MultiplayerBehaviour::c_MaxPlayerCount = 4;
+
+// If the game hasn't answered a handshake in this long, give up on that client
+// so everyone queued behind it isn't stuck forever.
+static TimeDurationNS const c_HandshakeTimeoutNS = 10ll * UpdateTimer::c_1UPS;
+
+// Players the session can actually hold: whatever the game has room for, capped
+// at c_MaxPlayerCount.
+static u8 GetSessionPlayerCapacity(GameStructures::RogueAssistantHeader const& rogueHeader)
+{
+	u32 const capacity = rogueHeader.netPlayerCount < MultiplayerBehaviour::c_MaxPlayerCount ? rogueHeader.netPlayerCount : MultiplayerBehaviour::c_MaxPlayerCount;
+	return static_cast<u8>(capacity);
+}
+
+static u8 GetPeerPlayerId(ENetPeer const* peer)
+{
+	return static_cast<u8>(reinterpret_cast<size_t>(peer->data));
+}
+
+static void SetPeerPlayerId(ENetPeer* peer, u8 playerId)
+{
+	size_t value = playerId;
+	peer->data = reinterpret_cast<void*>(value);
+}
 
 // Every offset/size below comes out of the game's own RAM, and every packet size
 // comes off the network. Both were previously only sanity-checked with ASSERT_*,
@@ -95,6 +119,8 @@ MultiplayerBehaviour::MultiplayerBehaviour()
 	, m_NetPeer(nullptr)
 	, m_ConnState(ConnectionState::Default)
 	, m_HasAttemptedConnection(false)
+	, m_ConnectedPlayerCount(0)
+	, m_MaxPlayerCount(0)
 {
 }
 
@@ -110,6 +136,7 @@ void MultiplayerBehaviour::OnAttach(GameConnection& game)
 		u8 requestFlags = multiplayerBlob[rogueHeader.netRequestStateOffset];
 		m_RequestFlags.store(requestFlags, std::memory_order_relaxed);
 		m_HasAttemptedConnection.store(false, std::memory_order_release);
+		m_MaxPlayerCount.store(GetSessionPlayerCapacity(rogueHeader), std::memory_order_relaxed);
 	}
 }
 
@@ -208,44 +235,21 @@ void MultiplayerBehaviour::OnUpdate(GameConnection& game)
 		return;
 	}
 
-	if (m_ServerState.m_PendingHandshake)
+	if (IsHost())
 	{
-		// Temporarily pause incoming requests if we're processing a handshake
-		ASSERT_MSG(IsHost(), "Can only process handshakes if as host");
-
-		u8 handshakeState = multiplayerBlob[rogueHeader.netHandshakeOffset + rogueHeader.netHandshakeStateOffset];
-		if (handshakeState == NET_HANDSHAKE_STATE_SEND_TO_CLIENT)
-		{
-			u8 playerId = multiplayerBlob[rogueHeader.netHandshakeOffset + rogueHeader.netHandshakePlayerIdOffset];
-
-			if (!IsValidClientPlayerId(rogueHeader, playerId))
-			{
-				LOG_ERROR("Game assigned an out of range player ID (%u, max %u); dropping handshake", (unsigned)playerId, (unsigned)rogueHeader.netPlayerCount);
-				m_ServerState.m_PendingHandshake = nullptr;
-				return;
-			}
-
-			size_t value = playerId;
-			m_ServerState.m_PendingHandshake->data = reinterpret_cast<void*>(value);
-
-			ENetPacket* packet = enet_packet_create(
-				&multiplayerBlob[rogueHeader.netHandshakeOffset],
-				rogueHeader.netHandshakeSize,
-				ENET_PACKET_FLAG_RELIABLE
-			);
-			enet_peer_send(m_ServerState.m_PendingHandshake, RogueNetChannel::Handshake, packet);
-			m_ServerState.m_PendingHandshake = nullptr;
-
-			// Force sending out player profiles to all clients
-			m_ServerState.m_PlayerProfiles.clear();
-			return;
-		}
+		// Feed queued client handshakes through the game one at a time
+		if (m_ServerState.m_PendingHandshake)
+			UpdatePendingHandshake(game);
+		else
+			BeginNextHandshake(game);
 	}
-	else
-	{
-		// Handle incoming/outgoing messages
-		PollConnection(game);
-	}
+
+	// Handle incoming/outgoing messages
+	PollConnection(game);
+
+	// Client lost its host while polling; we're already on our way out
+	if (!IsHost() && m_NetPeer == nullptr)
+		return;
 
 	// Handle handshake
 	//
@@ -298,8 +302,21 @@ void MultiplayerBehaviour::OpenHostConnection(GameConnection& game)
 	address.host = ENET_HOST_ANY;
 	address.port = m_Port.load(std::memory_order_relaxed);
 
+	u8 const playerCapacity = GetSessionPlayerCapacity(rogueHeader);
+	m_MaxPlayerCount.store(playerCapacity, std::memory_order_relaxed);
+
+	if (playerCapacity < 2)
+	{
+		LOG_ERROR("ENet: Game only has room for %u player(s); cannot host", (unsigned)rogueHeader.netPlayerCount);
+		game.RemoveBehaviour(this);
+		return;
+	}
+
+	LOG_INFO("ENet: Hosting for up to %u players (game supports %u)", (unsigned)playerCapacity, (unsigned)rogueHeader.netPlayerCount);
+
+	// ENet refuses any connection beyond this, so extra players are turned away
 	ENetHost* netServer = enet_host_create(&address,
-		rogueHeader.netPlayerCount - 1, // client count
+		playerCapacity - 1, // client count
 		RogueNetChannel::Num,  // channel count
 		0,  // assumed incoming bandwidth
 		0   // assumed outgoing bandwidth
@@ -313,6 +330,7 @@ void MultiplayerBehaviour::OpenHostConnection(GameConnection& game)
 		return;
 	}
 
+	m_ConnectedPlayerCount.store(1, std::memory_order_relaxed);
 	m_ConnState.store(ConnectionState::ConnectionConfirmed, std::memory_order_relaxed);
 }
 
@@ -419,6 +437,11 @@ void MultiplayerBehaviour::CloseConnection(GameConnection& game)
 		m_NetServer.store(nullptr, std::memory_order_relaxed);
 		enet_host_destroy(netServer);
 		enet_deinitialize();
+
+		// Every peer went with the host
+		m_ServerState.m_HandshakeQueue.clear();
+		m_ServerState.m_PendingHandshake = nullptr;
+		m_ConnectedPlayerCount.store(0, std::memory_order_relaxed);
 	}
 
 	if (m_NetClient != nullptr)
@@ -451,6 +474,7 @@ void MultiplayerBehaviour::PollConnection(GameConnection& game)
 			case ENET_EVENT_TYPE_CONNECT:
 				LOG_INFO("ENet: Connected %x:%u", netEvent.peer->address.host, netEvent.peer->address.port);
 				SetPeerTimeouts(netEvent.peer);
+				SetPeerPlayerId(netEvent.peer, 0); // not joined until the handshake completes
 				break;
 
 			case ENET_EVENT_TYPE_RECEIVE:
@@ -459,6 +483,7 @@ void MultiplayerBehaviour::PollConnection(GameConnection& game)
 
 			case ENET_EVENT_TYPE_DISCONNECT:
 				LOG_INFO("ENet: Disconnected %x:%u", netEvent.peer->address.host, netEvent.peer->address.port);
+				HandlePeerDisconnect(game, netEvent.peer);
 				break;
 
 			default:
@@ -582,16 +607,34 @@ void MultiplayerBehaviour::HandleIncomingMessage(GameConnection& game, ENetEvent
 		// data[netHandshakePlayerIdOffset] past the end of it.
 		if (netEvent.packet->dataLength == rogueHeader.netHandshakeSize)
 		{
-			game.WriteRequest(CreateAnonymousMessageId(), multiplayerAddress + rogueHeader.netHandshakeOffset, netEvent.packet->data, netEvent.packet->dataLength);
-
-			// If we're the host wait until we get a response
 			if (IsHost())
 			{
-				ASSERT_MSG(m_ServerState.m_PendingHandshake == nullptr, "Host cannot handle multiple handshakes at once");
-				m_ServerState.m_PendingHandshake = netEvent.peer;
+				// Several clients may be joining at once, so queue this up and
+				// hand it to the game once any in-flight handshake is done.
+				bool alreadyQueued = (m_ServerState.m_PendingHandshake == netEvent.peer);
+				for (QueuedHandshake const& queued : m_ServerState.m_HandshakeQueue)
+					alreadyQueued |= (queued.m_Peer == netEvent.peer);
+
+				if (alreadyQueued)
+				{
+					LOG_WARN("ENet: Ignoring duplicate handshake from %x:%u", netEvent.peer->address.host, netEvent.peer->address.port);
+				}
+				else if (GetPeerPlayerId(netEvent.peer) != 0)
+				{
+					LOG_WARN("ENet: Ignoring handshake from already joined player %u", (unsigned)GetPeerPlayerId(netEvent.peer));
+				}
+				else
+				{
+					QueuedHandshake queued;
+					queued.m_Peer = netEvent.peer;
+					queued.m_Data.assign(netEvent.packet->data, netEvent.packet->data + netEvent.packet->dataLength);
+					m_ServerState.m_HandshakeQueue.push_back(std::move(queued));
+				}
 			}
 			else
 			{
+				game.WriteRequest(CreateAnonymousMessageId(), multiplayerAddress + rogueHeader.netHandshakeOffset, netEvent.packet->data, netEvent.packet->dataLength);
+
 				if (m_ConnState.load(std::memory_order_relaxed) == ConnectionState::AwaitingResponse)
 				{
 					u8 const playerId = netEvent.packet->data[rogueHeader.netHandshakePlayerIdOffset];
@@ -607,9 +650,7 @@ void MultiplayerBehaviour::HandleIncomingMessage(GameConnection& game, ENetEvent
 					}
 
 					m_PlayerId = playerId;
-
-					size_t value = m_PlayerId;
-					netEvent.peer->data = reinterpret_cast<void*>(value);
+					SetPeerPlayerId(netEvent.peer, m_PlayerId);
 
 					// Client recieved handshake response so confirm connection
 					m_ConnState.store(ConnectionState::ConnectionConfirmed, std::memory_order_relaxed);
@@ -667,8 +708,7 @@ void MultiplayerBehaviour::HandleIncomingMessage(GameConnection& game, ENetEvent
 			// Expect clients to only send their state
 			if (netEvent.packet->dataLength == rogueHeader.netPlayerStateSize)
 			{
-				size_t value = reinterpret_cast<size_t>(netEvent.peer->data);
-				u8 playerId = static_cast<u8>(value);
+				u8 playerId = GetPeerPlayerId(netEvent.peer);
 				if (playerId != 0 && playerId < rogueHeader.netPlayerCount)
 				{
 					game.WriteRequest(
@@ -724,4 +764,186 @@ void MultiplayerBehaviour::SendMultiplayerConfirmationToGame(GameConnection& gam
 
 	u8 const requestFlags = m_RequestFlags.load(std::memory_order_relaxed);
 	game.WriteRequest(CreateAnonymousMessageId(), multiplayerAddress + rogueHeader.netCurrentStateOffset, &requestFlags, sizeof(requestFlags));
+}
+
+void MultiplayerBehaviour::HandlePeerDisconnect(GameConnection& game, ENetPeer* peer)
+{
+	if (!IsHost())
+	{
+		// Lost the host, so there's no session left to be part of
+		if (peer == m_NetPeer)
+		{
+			LOG_WARN("ENet: Lost connection to host");
+			m_NetPeer = nullptr;
+			game.RemoveBehaviour(this);
+		}
+		return;
+	}
+
+	u8 const playerId = GetPeerPlayerId(peer);
+	if (playerId != 0)
+		LOG_INFO("ENet: Player %u left", (unsigned)playerId);
+
+	SetPeerPlayerId(peer, 0);
+
+	auto& queue = m_ServerState.m_HandshakeQueue;
+	for (auto it = queue.begin(); it != queue.end();)
+	{
+		if (it->m_Peer == peer)
+			it = queue.erase(it);
+		else
+			++it;
+	}
+
+	// The game may still reply to it; that reply just gets dropped once the
+	// next handshake is written over it.
+	if (m_ServerState.m_PendingHandshake == peer)
+		m_ServerState.m_PendingHandshake = nullptr;
+
+	RefreshConnectedPlayerCount();
+}
+
+void MultiplayerBehaviour::BeginNextHandshake(GameConnection& game)
+{
+	ASSERT_MSG(IsHost(), "Can only process handshakes if as host");
+
+	if (m_ServerState.m_HandshakeQueue.empty())
+		return;
+
+	GameStructures::RogueAssistantHeader const& rogueHeader = game.GetObservedGameMemory().GetRogueHeader();
+	u8 const* multiplayerBlob = game.GetObservedGameMemory().GetMultiplayerStateBlob();
+	GameAddress multiplayerAddress = game.GetObservedGameMemory().GetMultiplayerStatePtr();
+
+	QueuedHandshake queued = std::move(m_ServerState.m_HandshakeQueue.front());
+	m_ServerState.m_HandshakeQueue.pop_front();
+
+	// Size was checked on receipt, but the layout can change under us
+	if (queued.m_Data.size() != rogueHeader.netHandshakeSize)
+	{
+		LOG_ERROR("Queued handshake size mismatch: got %u, expected %u", (unsigned)queued.m_Data.size(), (unsigned)rogueHeader.netHandshakeSize);
+		return;
+	}
+
+	// The handshake slot still holds whatever the game answered last time, so
+	// remember it; only a *different* answer is the reply to this handshake.
+	m_ServerState.m_StaleHandshake.assign(
+		&multiplayerBlob[rogueHeader.netHandshakeOffset],
+		&multiplayerBlob[rogueHeader.netHandshakeOffset] + rogueHeader.netHandshakeSize
+	);
+	m_ServerState.m_HasSeenHandshakeCleared = false;
+	m_ServerState.m_PendingHandshakeStart = UpdateTimer::GetCurrentClock();
+	m_ServerState.m_PendingHandshake = queued.m_Peer;
+
+	game.WriteRequest(CreateAnonymousMessageId(), multiplayerAddress + rogueHeader.netHandshakeOffset, queued.m_Data.data(), queued.m_Data.size());
+}
+
+void MultiplayerBehaviour::AbortPendingHandshake(char const* reason)
+{
+	ENetPeer* peer = m_ServerState.m_PendingHandshake;
+	m_ServerState.m_PendingHandshake = nullptr;
+
+	if (peer != nullptr)
+	{
+		LOG_ERROR("ENet: Dropping handshake from %x:%u: %s", peer->address.host, peer->address.port, reason);
+		enet_peer_disconnect(peer, 0);
+	}
+}
+
+void MultiplayerBehaviour::UpdatePendingHandshake(GameConnection& game)
+{
+	ASSERT_MSG(IsHost(), "Can only process handshakes if as host");
+
+	GameStructures::RogueAssistantHeader const& rogueHeader = game.GetObservedGameMemory().GetRogueHeader();
+	u8 const* multiplayerBlob = game.GetObservedGameMemory().GetMultiplayerStateBlob();
+	u8 const* handshake = &multiplayerBlob[rogueHeader.netHandshakeOffset];
+
+	u8 const handshakeState = handshake[rogueHeader.netHandshakeStateOffset];
+
+	if (handshakeState != NET_HANDSHAKE_STATE_SEND_TO_CLIENT)
+	{
+		// Our write has landed (or the game is mid way through it), so the next
+		// SEND_TO_CLIENT we see is definitely for this client.
+		m_ServerState.m_HasSeenHandshakeCleared = true;
+	}
+	else
+	{
+		bool const isFreshReply = m_ServerState.m_HasSeenHandshakeCleared ||
+			memcmp(handshake, m_ServerState.m_StaleHandshake.data(), rogueHeader.netHandshakeSize) != 0;
+
+		if (isFreshReply)
+		{
+			u8 const playerId = handshake[rogueHeader.netHandshakePlayerIdOffset];
+
+			if (!IsValidClientPlayerId(rogueHeader, playerId) || playerId >= m_MaxPlayerCount.load(std::memory_order_relaxed))
+			{
+				LOG_ERROR("Game assigned an out of range player ID (%u, max %u)", (unsigned)playerId, (unsigned)m_MaxPlayerCount.load(std::memory_order_relaxed));
+				AbortPendingHandshake("invalid player ID");
+				return;
+			}
+
+			if (IsPlayerIdInUse(playerId, m_ServerState.m_PendingHandshake))
+			{
+				LOG_ERROR("Game assigned player ID %u which is already in use", (unsigned)playerId);
+				AbortPendingHandshake("duplicate player ID");
+				return;
+			}
+
+			ENetPeer* peer = m_ServerState.m_PendingHandshake;
+			m_ServerState.m_PendingHandshake = nullptr;
+
+			SetPeerPlayerId(peer, playerId);
+			LOG_INFO("ENet: Player %u joined", (unsigned)playerId);
+
+			ENetPacket* packet = enet_packet_create(
+				handshake,
+				rogueHeader.netHandshakeSize,
+				ENET_PACKET_FLAG_RELIABLE
+			);
+			enet_peer_send(peer, RogueNetChannel::Handshake, packet);
+
+			// Force sending out player profiles to all clients
+			m_ServerState.m_PlayerProfiles.clear();
+			RefreshConnectedPlayerCount();
+			return;
+		}
+	}
+
+	if (UpdateTimer::GetCurrentClock() - m_ServerState.m_PendingHandshakeStart > c_HandshakeTimeoutNS)
+		AbortPendingHandshake("timed out waiting for the game to respond");
+}
+
+bool MultiplayerBehaviour::IsPlayerIdInUse(u8 playerId, ENetPeer* ignorePeer) const
+{
+	ENetHost* netServer = m_NetServer.load(std::memory_order_relaxed);
+	if (netServer == nullptr)
+		return false;
+
+	for (size_t i = 0; i < netServer->peerCount; ++i)
+	{
+		ENetPeer const* peer = &netServer->peers[i];
+		if (peer == ignorePeer || peer->state != ENET_PEER_STATE_CONNECTED)
+			continue;
+
+		if (GetPeerPlayerId(peer) == playerId)
+			return true;
+	}
+
+	return false;
+}
+
+void MultiplayerBehaviour::RefreshConnectedPlayerCount()
+{
+	ENetHost* netServer = m_NetServer.load(std::memory_order_relaxed);
+	if (netServer == nullptr)
+		return;
+
+	u8 count = 1; // the host
+	for (size_t i = 0; i < netServer->peerCount; ++i)
+	{
+		ENetPeer const* peer = &netServer->peers[i];
+		if (peer->state == ENET_PEER_STATE_CONNECTED && GetPeerPlayerId(peer) != 0)
+			++count;
+	}
+
+	m_ConnectedPlayerCount.store(count, std::memory_order_relaxed);
 }

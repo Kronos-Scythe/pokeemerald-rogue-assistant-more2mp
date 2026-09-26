@@ -403,7 +403,8 @@ void PrimaryUI::RenderMultiplayerPage(Window& window, MultiplayerBehaviour* mult
 		{
 			m_Assets->DrawLeftAlignedText(
 				gfx,
-				"Hosting on Port:" + std::to_string(multiplayer->GetPort()),
+				"Hosting on Port:" + std::to_string(multiplayer->GetPort()) +
+				"\nPlayers: " + std::to_string(multiplayer->GetConnectedPlayerCount()) + "/" + std::to_string(multiplayer->GetMaxPlayerCount()),
 				c_CentreOffset + sf::Vector2f(-90, -40),
 				16,
 				m_Assets->m_LightFontColour
@@ -443,7 +444,7 @@ void PrimaryUI::RenderHomeBoxPage(Window& window, HomeBoxBehaviour* homebox, boo
 	// Print state
 	m_Assets->DrawCenteredText(
 		gfx,
-		"Transferring Pokémon Boxes",
+		"Transferring Pokï¿½mon Boxes",
 		c_CentreOffset + sf::Vector2f(0, -55),
 		16,
 		m_Assets->m_LightFontColour
